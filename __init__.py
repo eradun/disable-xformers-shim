@@ -1,66 +1,65 @@
 """
-ComfyUI custom node shim that uninstalls xformers at boot.
+ComfyUI custom node shim that monkey-patches xformers.ops.memory_efficient_attention
+to use torch's SDPA so EVA-CLIP / PuLID don't crash on cu130 containers where
+xformers 0.0.35 has no working CUDA backend.
 
-Why this exists:
-  ComfyDeploy machine builder v4 ships pytorch 2.11.0+cu130 with xformers
-  0.0.35 — but xformers 0.0.35 has no CUDA backend for cu130. Modules
-  like EVA-CLIP (used by PuLID-Flux II) call xformers.ops.memory_efficient_
-  attention unconditionally and crash with `NotImplementedError: No operator
-  found for memory_efficient_attention_forward`. Their fallback path only
-  triggers when `import xformers` itself fails.
-
-  Solution: uninstall xformers at ComfyUI startup, BEFORE any other custom
-  node imports it. EVA-CLIP's `try: import xformers` then fails cleanly,
-  setting `XFORMERS_IS_AVAILBLE = False`, which routes attention through
-  torch's built-in scaled_dot_product_attention (SDPA) — fast on cu130.
-
-  No user-facing nodes; this module exists purely for its side effect at
-  import time.
+Approach (revised after pip-uninstall + sys.modules-shadow approaches failed):
+  pip uninstall doesn't help - modules already imported retain their references.
+  sys.modules shadow doesn't help - modules that did `from xformers.ops import ...`
+    captured the original reference at import time.
+  **Monkey-patching the function on the existing xformers.ops module DOES work**
+  because EVA-CLIP calls `xops.memory_efficient_attention(...)` (attribute lookup
+  at call time, not at import time). Reassigning the attribute makes new calls
+  use our replacement.
 
 Side effects on other engines:
-  - Wan 2.2 family (s2v, animate, a14b, 5b): use sage-attention, not
-    xformers. Boot log already shows "sageattention will not be available"
-    on builder v4, so Wan was relying on torch SDPA anyway. No change.
-  - LTX 2.3: torch SDPA. No change.
-  - Qwen-Image-Edit: torch SDPA. No change.
+  - Wan family: doesn't use xformers (sageattention path; the boot log shows
+    `sageattention will not be available`, so Wan was already on torch SDPA).
+  - LTX 2.3: doesn't use xformers.
+  - Qwen-Image-Edit: doesn't use xformers.
 
 Usage:
-  Add `https://github.com/<your-user>/disable-xformers-shim` to your
-  ComfyDeploy machine's custom-node list. Save & Build. Done.
+  Add this repo URL to your ComfyDeploy machine's custom-node list. Save & Build.
+  The patch runs once at custom-node import time.
 """
-import subprocess
-import sys
+import torch
 
-try:
-    result = subprocess.run(
-        [sys.executable, '-m', 'pip', 'uninstall', '-y', 'xformers'],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
+
+def _torch_sdpa_replacement(q, k, v, attn_bias=None, scale=None, p=0.0, **_unused):
+    """Drop-in replacement for xformers.ops.memory_efficient_attention.
+
+    EVA-CLIP feeds (B, M, H, D); torch SDPA expects (B, H, M, D).
+    Transpose in, run SDPA, transpose out.
+    """
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    out_t = torch.nn.functional.scaled_dot_product_attention(
+        q_t, k_t, v_t,
+        attn_mask=attn_bias,
+        dropout_p=p,
+        scale=scale,
     )
-    print('[disable-xformers-shim] pip uninstall xformers ->', result.returncode)
-    if result.stdout:
-        print('[disable-xformers-shim]', result.stdout.strip()[:200])
-except Exception as e:
-    print('[disable-xformers-shim] uninstall failed (non-fatal):', e)
+    return out_t.transpose(1, 2)
 
-# Belt-and-suspenders: even if uninstall didn't take effect (cached wheels,
-# read-only fs, etc), force-fail any future `import xformers`.
-class _XformersShim:
-    def __getattr__(self, name):
-        raise ImportError("xformers disabled by disable-xformers-shim")
 
-# Only shadow if not already disabled by uninstall
-try:
-    import xformers  # type: ignore
-    # If we got here, uninstall didn't take. Shadow the module.
-    sys.modules['xformers'] = _XformersShim()  # type: ignore
-    sys.modules['xformers.ops'] = _XformersShim()  # type: ignore
-    print('[disable-xformers-shim] xformers shadowed')
-except ImportError:
-    print('[disable-xformers-shim] xformers cleanly removed')
+def _apply_patch():
+    try:
+        import xformers
+        import xformers.ops as xops
+    except ImportError:
+        print('[disable-xformers-shim] xformers not present - nothing to patch')
+        return
 
-# ComfyUI custom-node interface — empty maps, no user-facing nodes.
+    if getattr(xops, '_vs_patched', False):
+        return
+    xops._vs_original_mea = xops.memory_efficient_attention
+    xops.memory_efficient_attention = _torch_sdpa_replacement
+    xops._vs_patched = True
+    print('[disable-xformers-shim] xformers.ops.memory_efficient_attention patched -> torch SDPA')
+
+
+_apply_patch()
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
